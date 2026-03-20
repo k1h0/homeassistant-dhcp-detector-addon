@@ -10,3 +10,15 @@ configuration:
       List of devices to track. Each entry requires a MAC address and a
       friendly name used to form the sensor entity ID
       (sensor.dhcp_last_seen_<name>) in Home Assistant.
+  log_level:
+    name: Log Level
+    description: >-
+      Verbosity of add-on logging. Use "debug" to enable detailed per-packet
+      diagnostics and a 30-second counter summary. "info" is the default and
+      keeps logs minimal.
+  disable_bpf:
+    name: Disable BPF Filter
+    description: >-
+      When enabled, the BPF kernel filter is not attached and the socket
+      receives all Ethernet frames (unfiltered). Useful for troubleshooting
+      when the BPF filter may be interfering with packet capture.

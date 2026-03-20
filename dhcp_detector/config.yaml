@@ -25,9 +25,29 @@ boot: auto
 options:
   interface: "eth0"
   devices: []
+  log_level: "info"
+  disable_bpf: false
 
 schema:
   interface: str
   devices:
     - mac: str
       name: str
+  log_level: "list(debug|info|warning|error)"
+  disable_bpf: bool
+
+# Selector configuration for the HA UI
+ui_schema:
+  log_level:
+    name: Log Level
+    selector:
+      select:
+        options:
+          - label: Debug
+            value: debug
+          - label: Info
+            value: info
+          - label: Warning
+            value: warning
+          - label: Error
+            value: error

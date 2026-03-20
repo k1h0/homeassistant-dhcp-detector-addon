@@ -10,3 +10,15 @@ configuration:
       Liste der zu überwachenden Geräte. Jeder Eintrag benötigt eine
       MAC-Adresse und einen Anzeigenamen, der die Sensor-Entitäts-ID
       (sensor.dhcp_last_seen_<name>) in Home Assistant bildet.
+  log_level:
+    name: Log-Level
+    description: >-
+      Ausführlichkeit der Add-on-Protokollierung. Mit "debug" werden detaillierte
+      Paket-Diagnosen und eine 30-Sekunden-Zusammenfassung der Zähler aktiviert.
+      "info" ist der Standard und hält die Logs minimal.
+  disable_bpf:
+    name: BPF-Filter deaktivieren
+    description: >-
+      Wenn aktiviert, wird der BPF-Kernelfilter nicht angehängt und der Socket
+      empfängt alle Ethernet-Frames (ungefiltert). Nützlich zur Fehlersuche,
+      wenn der BPF-Filter die Paketaufzeichnung beeinträchtigt.

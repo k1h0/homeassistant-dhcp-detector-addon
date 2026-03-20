@@ -23,6 +23,71 @@ import urllib.request
 from datetime import datetime
 
 # ---------------------------------------------------------------------------
+# Diagnostics counters
+# ---------------------------------------------------------------------------
+
+class DiagCounters:
+    """Thread-safe counters for diagnostic packet tracing."""
+
+    __slots__ = (
+        "_lock",
+        "received",
+        "drop_too_short",
+        "drop_ethertype",
+        "drop_not_ipv4",
+        "drop_not_udp",
+        "drop_udp_truncated",
+        "drop_ports",
+        "drop_bootp_len",
+        "drop_not_bootrequest",
+        "drop_magic_cookie",
+        "drop_no_opt53",
+        "drop_msg_type",
+        "drop_mac_not_tracked",
+        "matched",
+    )
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        for slot in self.__slots__[1:]:
+            setattr(self, slot, 0)
+
+    def inc(self, name: str) -> None:
+        with self._lock:
+            setattr(self, name, getattr(self, name) + 1)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {s: getattr(self, s) for s in self.__slots__[1:]}
+
+
+_counters = DiagCounters()
+
+
+def _diag_summary_thread(stop_event: threading.Event, interval: int = 30) -> None:
+    """Periodically log a one-line diagnostic summary at DEBUG level."""
+    while not stop_event.wait(interval):
+        snap = _counters.snapshot()
+        logging.debug(
+            "diag: recv=%d short=%d etype=%d ipv4=%d udp=%d udp_trunc=%d ports=%d "
+            "bootp=%d bootreq=%d cookie=%d opt53=%d msgtype=%d mac=%d matched=%d",
+            snap["received"],
+            snap["drop_too_short"],
+            snap["drop_ethertype"],
+            snap["drop_not_ipv4"],
+            snap["drop_not_udp"],
+            snap["drop_udp_truncated"],
+            snap["drop_ports"],
+            snap["drop_bootp_len"],
+            snap["drop_not_bootrequest"],
+            snap["drop_magic_cookie"],
+            snap["drop_no_opt53"],
+            snap["drop_msg_type"],
+            snap["drop_mac_not_tracked"],
+            snap["matched"],
+        )
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
@@ -100,40 +165,62 @@ def parse_dhcp_packet(data: bytes):
 
     Returns ``(mac_str, dhcp_message_type)`` for valid DHCP client packets,
     or ``None`` if the frame is not a DHCP client packet.
+
+    Diagnostic counters in ``_counters`` are incremented at each rejection
+    stage so that the periodic summary can report where frames are being
+    dropped.
     """
+    _counters.inc("received")
+
     # --- Ethernet header (14 bytes) ---
     if len(data) < 14:
+        _counters.inc("drop_too_short")
+        logging.debug("drop: frame too short (%d bytes)", len(data))
         return None
     ethertype = struct.unpack_from("!H", data, 12)[0]
     if ethertype != ETHERTYPE_IPV4:
+        _counters.inc("drop_ethertype")
+        logging.debug("drop: ethertype=0x%04x (not IPv4)", ethertype)
         return None
 
     # --- IPv4 header ---
     ip_start = 14
     if len(data) < ip_start + 20:
+        _counters.inc("drop_not_ipv4")
+        logging.debug("drop: IPv4 header truncated")
         return None
     ip_ihl = (data[ip_start] & 0x0F) * 4
     ip_proto = data[ip_start + 9]
     if ip_proto != IP_PROTO_UDP:
+        _counters.inc("drop_not_udp")
+        logging.debug("drop: IP proto=%d (not UDP)", ip_proto)
         return None
 
     # --- UDP header (8 bytes) ---
     udp_start = ip_start + ip_ihl
     if len(data) < udp_start + 8:
+        _counters.inc("drop_udp_truncated")
+        logging.debug("drop: UDP header truncated")
         return None
     src_port = struct.unpack_from("!H", data, udp_start)[0]
     dst_port = struct.unpack_from("!H", data, udp_start + 2)[0]
     if src_port != DHCP_CLIENT_PORT or dst_port != DHCP_SERVER_PORT:
+        _counters.inc("drop_ports")
+        logging.debug("drop: UDP ports %d→%d (need 68→67)", src_port, dst_port)
         return None
 
     # --- BOOTP / DHCP payload ---
     # Fixed BOOTP header: 236 bytes; magic cookie: 4 bytes → 240 bytes minimum.
     bootp_start = udp_start + 8
     if len(data) < bootp_start + 240:
+        _counters.inc("drop_bootp_len")
+        logging.debug("drop: BOOTP payload too short")
         return None
 
     # op == 1: BOOTREQUEST (client → server)
     if data[bootp_start] != 1:
+        _counters.inc("drop_not_bootrequest")
+        logging.debug("drop: BOOTP op=%d (not BOOTREQUEST)", data[bootp_start])
         return None
 
     # Client hardware address (MAC) is at offset 28 inside BOOTP, 6 bytes.
@@ -144,6 +231,8 @@ def parse_dhcp_packet(data: bytes):
     # Validate magic cookie.
     magic = struct.unpack_from("!I", data, bootp_start + 236)[0]
     if magic != BOOTP_MAGIC_COOKIE:
+        _counters.inc("drop_magic_cookie")
+        logging.debug("drop: bad BOOTP magic cookie 0x%08x", magic)
         return None
 
     # --- Parse DHCP options to find message type (option 53) ---
@@ -167,6 +256,8 @@ def parse_dhcp_packet(data: bytes):
         idx += 2 + opt_len
 
     if dhcp_type is None:
+        _counters.inc("drop_no_opt53")
+        logging.debug("drop: DHCP option 53 (message type) not found")
         return None
 
     return mac, dhcp_type
@@ -225,6 +316,8 @@ def update_sensor(token: str, mac: str, name: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def main():
+    # Preliminary basicConfig so early errors are visible; will be reconfigured
+    # below once options are loaded and the desired log level is known.
     logging.basicConfig(
         level=logging.INFO,
         format="%(message)s",
@@ -242,6 +335,14 @@ def main():
 
     interface = options.get("interface", "eth0")
     devices = options.get("devices", [])
+    log_level_str = options.get("log_level", "info").upper()
+    disable_bpf = options.get("disable_bpf", False)
+
+    # Reconfigure logging with the user-chosen level.
+    numeric_level = getattr(logging, log_level_str, logging.INFO)
+    logging.getLogger().setLevel(numeric_level)
+    for handler in logging.getLogger().handlers:
+        handler.setLevel(numeric_level)
 
     token = os.environ.get("SUPERVISOR_TOKEN", "")
     if not token:
@@ -260,6 +361,10 @@ def main():
     for mac, name in device_map.items():
         dev_id = sanitize_dev_id(name)  # sanitized entity ID used in the log
         logging.info("  tracking: %s → %s (sensor.dhcp_last_seen_%s)", mac, name, dev_id)
+
+    if disable_bpf:
+        logging.info("BPF filter disabled — running unfiltered capture (disable_bpf=true)")
+    logging.debug("log_level=%s disable_bpf=%s", log_level_str, disable_bpf)
 
     stop_event = threading.Event()
 
@@ -285,9 +390,21 @@ def main():
         logging.error("Failed to open raw socket on %s: %s", interface, exc)
         sys.exit(1)
 
-    attach_bpf(sock)
+    if disable_bpf:
+        logging.debug("Skipping BPF attachment (disable_bpf=true)")
+    else:
+        attach_bpf(sock)
 
     logging.info("Listening on %s …", interface)
+
+    # Start background thread that logs a periodic diagnostic summary at DEBUG level.
+    diag_thread = threading.Thread(
+        target=_diag_summary_thread,
+        args=(stop_event,),
+        daemon=True,
+        name="diag-summary",
+    )
+    diag_thread.start()
 
     while not stop_event.is_set():
         try:
@@ -306,10 +423,15 @@ def main():
 
         mac, dhcp_type = result
         if dhcp_type not in TRACKED_MSG_TYPES:
+            _counters.inc("drop_msg_type")
+            logging.debug("drop: DHCP message type %d not tracked", dhcp_type)
             continue
         if mac not in device_map:
+            _counters.inc("drop_mac_not_tracked")
+            logging.debug("drop: MAC %s not in tracked device list", mac)
             continue
 
+        _counters.inc("matched")
         name = device_map[mac]
         # Derive the sanitized entity ID the same way update_sensor does.
         dev_id = sanitize_dev_id(name)  # deduplicated via module-level helper
