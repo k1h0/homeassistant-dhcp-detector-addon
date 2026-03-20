@@ -1,0 +1,33 @@
+name: DHCP Detector
+description: Passive DHCP sniffing for presence detection via timestamp sensors
+version: "1.0.0"
+slug: dhcp_detector
+init: false
+
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+  - i386
+
+# Requires raw socket access to the host network interface.
+host_network: true
+capabilities:
+  - NET_RAW
+
+# Grants the add-on access to the HA Core REST API via the Supervisor proxy.
+homeassistant_api: true
+
+startup: application
+boot: auto
+
+options:
+  interface: "eth0"
+  devices: []
+
+schema:
+  interface: str
+  devices:
+    - mac: str
+      name: str

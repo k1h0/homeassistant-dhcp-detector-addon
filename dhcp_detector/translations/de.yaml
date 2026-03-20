@@ -1,0 +1,12 @@
+configuration:
+  interface:
+    name: Netzwerk-Interface
+    description: >-
+      Name des Netzwerk-Interfaces, auf dem DHCP-Verkehr mitgelesen wird
+      (z. B. eth0, enp3s0, wlan0).
+  devices:
+    name: Überwachte Geräte
+    description: >-
+      Liste der zu überwachenden Geräte. Jeder Eintrag benötigt eine
+      MAC-Adresse und einen Anzeigenamen, der die Sensor-Entitäts-ID
+      (sensor.dhcp_last_seen_<name>) in Home Assistant bildet.

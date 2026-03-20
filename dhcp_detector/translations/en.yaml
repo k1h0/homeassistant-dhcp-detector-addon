@@ -1,0 +1,12 @@
+configuration:
+  interface:
+    name: Network Interface
+    description: >-
+      Name of the network interface to sniff DHCP traffic on
+      (e.g. eth0, enp3s0, wlan0).
+  devices:
+    name: Tracked Devices
+    description: >-
+      List of devices to track. Each entry requires a MAC address and a
+      friendly name used to form the sensor entity ID
+      (sensor.dhcp_last_seen_<name>) in Home Assistant.
