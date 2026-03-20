@@ -3,8 +3,8 @@
 Passive DHCP sniffer for Home Assistant presence detection.
 
 Listens for DHCP DISCOVER, REQUEST, and INFORM packets on a raw socket,
-matches source MACs against a configured device list, and reports presence
-state to Home Assistant via the Supervisor REST API (device_tracker/see).
+matches source MACs against a configured device list, and writes a
+timestamp sensor state to Home Assistant via the Supervisor REST API.
 """
 
 import json
@@ -18,6 +18,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -121,17 +122,29 @@ def parse_dhcp_packet(data: bytes):
 # Home Assistant Supervisor API
 # ---------------------------------------------------------------------------
 
-HA_SERVICE_URL = "http://supervisor/homeassistant/api/services/device_tracker/see"
+HA_STATE_URL = "http://supervisor/homeassistant/api/states/sensor.dhcp_last_seen_{dev_id}"
 
 
-def report_presence(token: str, mac: str, dev_id: str, location: str) -> bool:
-    """POST a device_tracker/see call to HA via the Supervisor proxy.
+def update_sensor(token: str, mac: str, name: str) -> bool:
+    """POST a timestamp sensor state to HA via the Supervisor proxy.
+
+    Creates or updates ``sensor.dhcp_last_seen_<name>`` with the current
+    local time as the state value (ISO 8601 with timezone offset).
 
     Returns True on success, False on error.
     """
-    payload = json.dumps({"mac": mac, "dev_id": dev_id, "location_name": location}).encode()
+    timestamp = datetime.now().astimezone().isoformat()
+    payload = json.dumps({
+        "state": timestamp,
+        "attributes": {
+            "device_class": "timestamp",
+            "friendly_name": f"DHCP Last Seen {name}",
+            "mac": mac,
+        },
+    }).encode()
+    url = HA_STATE_URL.format(dev_id=name)
     req = urllib.request.Request(
-        HA_SERVICE_URL,
+        url,
         data=payload,
         headers={
             "Authorization": f"Bearer {token}",
@@ -141,43 +154,14 @@ def report_presence(token: str, mac: str, dev_id: str, location: str) -> bool:
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status == 200
+            return resp.status in (200, 201)
     except urllib.error.HTTPError as exc:
-        logging.error("HTTP error reporting %s (%s): %s %s", dev_id, mac, exc.code, exc.reason)
+        logging.error("HTTP error updating sensor for %s (%s): %s %s", name, mac, exc.code, exc.reason)
     except urllib.error.URLError as exc:
-        logging.error("URL error reporting %s (%s): %s", dev_id, mac, exc.reason)
+        logging.error("URL error updating sensor for %s (%s): %s", name, mac, exc.reason)
     except OSError as exc:
-        logging.error("Error reporting %s (%s): %s", dev_id, mac, exc)
+        logging.error("Error updating sensor for %s (%s): %s", name, mac, exc)
     return False
-
-
-# ---------------------------------------------------------------------------
-# Away timeout checker
-# ---------------------------------------------------------------------------
-
-def away_checker(token: str, device_map: dict, last_seen: dict, lock: threading.Lock,
-                 away_timeout: int, stop_event: threading.Event):
-    """Background daemon: mark devices as not_home after away_timeout seconds of silence."""
-    while not stop_event.wait(timeout=30):
-        now = time.time()
-        timed_out = []
-        with lock:
-            for mac, ts in list(last_seen.items()):
-                if now - ts > away_timeout:
-                    timed_out.append((mac, now - ts))
-            for mac, elapsed in timed_out:
-                last_seen.pop(mac, None)
-
-        for mac, elapsed in timed_out:
-            name = device_map.get(mac, mac)
-            logging.info(
-                "%s  AWAY  %s (%s) — no DHCP seen for %.0fs → not_home",
-                time.strftime("%Y-%m-%d %H:%M:%S"),
-                name,
-                mac,
-                elapsed,
-            )
-            report_presence(token, mac, name, "not_home")
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +185,6 @@ def main():
         sys.exit(1)
 
     interface = options.get("interface", "eth0")
-    away_timeout = int(options.get("away_timeout", 600))
     devices = options.get("devices", [])
 
     token = os.environ.get("SUPERVISOR_TOKEN", "")
@@ -216,14 +199,11 @@ def main():
         mac = dev["mac"].lower().replace("-", ":").strip()
         device_map[mac] = dev["name"]
 
-    logging.info("DHCP Detector starting — interface=%s, away_timeout=%ds, tracking %d device(s)",
-                 interface, away_timeout, len(device_map))
+    logging.info("DHCP Detector starting — interface=%s, tracking %d device(s)",
+                 interface, len(device_map))
     for mac, name in device_map.items():
-        logging.info("  tracking: %s → %s", mac, name)
+        logging.info("  tracking: %s → %s (sensor.dhcp_last_seen_%s)", mac, name, name)
 
-    # last_seen tracks the timestamp of the most recent DHCP packet per MAC.
-    last_seen: dict[str, float] = {}
-    lock = threading.Lock()
     stop_event = threading.Event()
 
     def handle_shutdown_signal(signum, frame):
@@ -232,14 +212,6 @@ def main():
 
     signal.signal(signal.SIGTERM, handle_shutdown_signal)
     signal.signal(signal.SIGINT, handle_shutdown_signal)
-
-    # Start away-timeout background thread.
-    t = threading.Thread(
-        target=away_checker,
-        args=(token, device_map, last_seen, lock, away_timeout, stop_event),
-        daemon=True,
-    )
-    t.start()
 
     # Open a raw AF_PACKET socket bound to the chosen interface.
     # AF_PACKET operates at Ethernet layer 2 and does NOT bind to any UDP/TCP
@@ -282,16 +254,15 @@ def main():
         name = device_map[mac]
         type_name = MSG_TYPE_NAMES.get(dhcp_type, str(dhcp_type))
         logging.info(
-            "%s  DHCP %-8s  %s (%s) → home",
+            "%s  DHCP %-8s  %s (%s) → sensor.dhcp_last_seen_%s",
             time.strftime("%Y-%m-%d %H:%M:%S"),
             type_name,
             name,
             mac,
+            name,
         )
 
-        with lock:
-            last_seen[mac] = time.time()
-        report_presence(token, mac, name, "home")
+        update_sensor(token, mac, name)
 
     sock.close()
     logging.info("DHCP Detector stopped.")

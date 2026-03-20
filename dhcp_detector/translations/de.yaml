@@ -4,14 +4,9 @@ configuration:
     description: >-
       Name des Netzwerk-Interfaces, auf dem DHCP-Verkehr mitgelesen wird
       (z. B. eth0, enp3s0, wlan0).
-  away_timeout:
-    name: Abwesenheits-Timeout
-    description: >-
-      Sekunden ohne DHCP-Paket, bevor ein Gerät als not_home gemeldet wird.
-      Standardwert ist 600 (10 Minuten).
   devices:
     name: Überwachte Geräte
     description: >-
       Liste der zu überwachenden Geräte. Jeder Eintrag benötigt eine
-      MAC-Adresse und einen Anzeigenamen, der als device_tracker-Entitäts-ID
-      in Home Assistant verwendet wird.
+      MAC-Adresse und einen Anzeigenamen, der die Sensor-Entitäts-ID
+      (sensor.dhcp_last_seen_<name>) in Home Assistant bildet.

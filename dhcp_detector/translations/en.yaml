@@ -4,13 +4,9 @@ configuration:
     description: >-
       Name of the network interface to sniff DHCP traffic on
       (e.g. eth0, enp3s0, wlan0).
-  away_timeout:
-    name: Away Timeout
-    description: >-
-      Seconds of DHCP silence before a device is reported as not_home.
-      Default is 600 (10 minutes).
   devices:
     name: Tracked Devices
     description: >-
       List of devices to track. Each entry requires a MAC address and a
-      friendly name that becomes the device_tracker entity ID in Home Assistant.
+      friendly name used to form the sensor entity ID
+      (sensor.dhcp_last_seen_<name>) in Home Assistant.

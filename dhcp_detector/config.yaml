@@ -1,5 +1,5 @@
 name: DHCP Detector
-description: Passive DHCP sniffing for presence detection via device_tracker entities
+description: Passive DHCP sniffing for presence detection via timestamp sensors
 version: "1.0.0"
 slug: dhcp_detector
 init: false
@@ -24,12 +24,10 @@ boot: auto
 
 options:
   interface: "eth0"
-  away_timeout: 600
   devices: []
 
 schema:
   interface: str
-  away_timeout: int
   devices:
     - mac: str
       name: str
