@@ -7,6 +7,7 @@ matches source MACs against a configured device list, and writes a
 timestamp sensor state to Home Assistant via the Supervisor REST API.
 """
 
+import re
 import json
 import logging
 import os
@@ -128,21 +129,23 @@ HA_STATE_URL = "http://supervisor/homeassistant/api/states/sensor.dhcp_last_seen
 def update_sensor(token: str, mac: str, name: str) -> bool:
     """POST a timestamp sensor state to HA via the Supervisor proxy.
 
-    Creates or updates ``sensor.dhcp_last_seen_<name>`` with the current
+    Creates or updates ``sensor.dhcp_last_seen_<dev_id>`` with the current
     local time as the state value (ISO 8601 with timezone offset).
 
     Returns True on success, False on error.
     """
+    # Sanitize name → valid HA entity ID segment (lowercase, only a-z/0-9/_).
+    dev_id = re.sub(r"[^a-z0-9_]", "_", name.lower()).strip("_")
     timestamp = datetime.now().astimezone().isoformat()
     payload = json.dumps({
         "state": timestamp,
         "attributes": {
             "device_class": "timestamp",
-            "friendly_name": f"DHCP Last Seen {name}",
+            "friendly_name": f"DHCP Last Seen {name}",  # human-readable, unchanged
             "mac": mac,
         },
     }).encode()
-    url = HA_STATE_URL.format(dev_id=name)
+    url = HA_STATE_URL.format(dev_id=dev_id)  # use sanitized dev_id in the URL
     req = urllib.request.Request(
         url,
         data=payload,
@@ -252,6 +255,8 @@ def main():
             continue
 
         name = device_map[mac]
+        # Derive the sanitized entity ID the same way update_sensor does.
+        dev_id = re.sub(r"[^a-z0-9_]", "_", name.lower()).strip("_")
         type_name = MSG_TYPE_NAMES.get(dhcp_type, str(dhcp_type))
         logging.info(
             "%s  DHCP %-8s  %s (%s) → sensor.dhcp_last_seen_%s",
@@ -259,7 +264,7 @@ def main():
             type_name,
             name,
             mac,
-            name,
+            dev_id,  # log the actual entity ID that will be written
         )
 
         update_sensor(token, mac, name)
