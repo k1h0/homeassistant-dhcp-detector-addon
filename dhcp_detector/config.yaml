@@ -1,6 +1,6 @@
 name: DHCP Detector
 description: Passive DHCP sniffing for presence detection via timestamp sensors
-version: "1.0.0"
+version: "1.0.1"
 slug: dhcp_detector
 init: false
 
