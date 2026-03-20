@@ -7,6 +7,7 @@ matches source MACs against a configured device list, and writes a
 timestamp sensor state to Home Assistant via the Supervisor REST API.
 """
 
+import ctypes
 import re
 import json
 import logging
@@ -37,6 +38,53 @@ DHCP_REQUEST = 3
 DHCP_INFORM = 8
 TRACKED_MSG_TYPES = {DHCP_DISCOVER, DHCP_REQUEST, DHCP_INFORM}
 MSG_TYPE_NAMES = {DHCP_DISCOVER: "DISCOVER", DHCP_REQUEST: "REQUEST", DHCP_INFORM: "INFORM"}
+
+# BPF filter equivalent to `tcpdump -dd "udp and (port 67 or port 68)"`.
+# Each tuple is (code, jt, jf, k).
+BPF_UDP_DHCP = [
+    (0x28, 0, 0, 0x0000000c), (0x15, 0, 8, 0x00000800),
+    (0x30, 0, 0, 0x00000017), (0x15, 0, 6, 0x00000011),
+    (0x28, 0, 0, 0x00000014), (0x45, 4, 0, 0x00001fff),
+    (0xb1, 0, 0, 0x0000000e), (0x48, 0, 0, 0x00000000),
+    (0x15, 1, 0, 0x00000043), (0x15, 0, 1, 0x00000044),
+    (0x06, 0, 0, 0x00040000), (0x06, 0, 0, 0x00000000),
+]
+
+SOL_SOCKET = 1
+SO_ATTACH_FILTER = 26
+
+
+def attach_bpf(sock: socket.socket) -> None:
+    """Attach a BPF filter to *sock* restricting delivery to UDP port 67/68.
+
+    Uses ctypes to build the ``sock_fprog`` structure expected by
+    ``setsockopt(SOL_SOCKET, SO_ATTACH_FILTER, ...)``.  On failure logs a
+    WARNING and returns without aborting startup.
+    """
+    # sock_filter: array of { __u16 code, __u8 jt, __u8 jf, __u32 k }
+    n = len(BPF_UDP_DHCP)
+    insn_bytes = b"".join(
+        struct.pack("HBBI", code, jt, jf, k)
+        for code, jt, jf, k in BPF_UDP_DHCP
+    )
+    insn_array = ctypes.create_string_buffer(insn_bytes)
+
+    # sock_fprog: { __u16 len, [padding], ptr filter }
+    # Pack manually to match kernel ABI on both 32-bit and 64-bit.
+    ptr = ctypes.addressof(insn_array)
+    if ctypes.sizeof(ctypes.c_void_p) == 8:
+        prog_bytes = struct.pack("H6xQ", n, ptr)
+    else:
+        prog_bytes = struct.pack("H2xI", n, ptr)
+
+    try:
+        sock.setsockopt(SOL_SOCKET, SO_ATTACH_FILTER, prog_bytes)
+        logging.info("BPF filter attached — receiving UDP port 67/68 only")
+    except OSError as exc:
+        logging.warning(
+            "BPF filter could not be attached, falling back to unfiltered capture: %s", exc
+        )
+
 
 # ---------------------------------------------------------------------------
 # Packet parsing
@@ -230,6 +278,8 @@ def main():
     except OSError as exc:
         logging.error("Failed to open raw socket on %s: %s", interface, exc)
         sys.exit(1)
+
+    attach_bpf(sock)
 
     logging.info("Listening on %s …", interface)
 
