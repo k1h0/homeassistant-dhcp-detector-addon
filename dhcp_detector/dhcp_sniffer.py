@@ -389,6 +389,58 @@ def parse_dhcp_packet(data: bytes):
 HA_STATE_URL = "http://supervisor/homeassistant/api/states/sensor.dhcp_last_seen_{dev_id}"
 
 
+def set_all_sensors_unavailable(token: str, device_map: dict) -> None:
+    """POST state 'unavailable' for every tracked sensor via the Supervisor API.
+
+    Preserves device_class and friendly_name so HA does not lose sensor metadata.
+    Called on startup (before the socket is opened) and on clean shutdown.
+    """
+    for mac, name in device_map.items():
+        dev_id = sanitize_dev_id(name)
+        payload = json.dumps({
+            "state": "unavailable",
+            "attributes": {
+                "device_class": "timestamp",
+                "friendly_name": f"DHCP Last Seen {name}",
+                "mac": mac,
+            },
+        }).encode()
+        url = HA_STATE_URL.format(dev_id=dev_id)
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status in (200, 201):
+                    logging.info("sensor.dhcp_last_seen_%s → unavailable", dev_id)
+                else:
+                    logging.warning(
+                        "Unexpected status setting sensor.dhcp_last_seen_%s unavailable: %s",
+                        dev_id, resp.status,
+                    )
+        except urllib.error.HTTPError as exc:
+            logging.error(
+                "HTTP error setting sensor.dhcp_last_seen_%s unavailable: %s %s",
+                dev_id, exc.code, exc.reason,
+            )
+        except urllib.error.URLError as exc:
+            logging.error(
+                "URL error setting sensor.dhcp_last_seen_%s unavailable: %s",
+                dev_id, exc.reason,
+            )
+        except OSError as exc:
+            logging.error(
+                "Error setting sensor.dhcp_last_seen_%s unavailable: %s",
+                dev_id, exc,
+            )
+
+
 def update_sensor(token: str, mac: str, name: str) -> bool:
     """POST a timestamp sensor state to HA via the Supervisor proxy.
 
@@ -485,10 +537,19 @@ def main():
         logging.info("BPF filter disabled — running unfiltered capture (disable_bpf=true)")
     logging.debug("log_level=%s disable_bpf=%s", log_level_str, disable_bpf)
 
+    # Mark all tracked sensors unavailable before the socket is opened so that
+    # HA reflects the correct state after a restart while the add-on is not yet running.
+    logging.info("Setting all sensors unavailable on startup …")
+    set_all_sensors_unavailable(token, device_map)
+
     stop_event = threading.Event()
 
     def handle_shutdown_signal(signum, frame):
         logging.info("Received signal %s — shutting down.", signum)
+        # Mark all tracked sensors unavailable before stopping so HA reflects
+        # the correct state when the add-on is stopped cleanly via the Supervisor.
+        logging.info("Setting all sensors unavailable on shutdown …")
+        set_all_sensors_unavailable(token, device_map)
         stop_event.set()
 
     signal.signal(signal.SIGTERM, handle_shutdown_signal)
