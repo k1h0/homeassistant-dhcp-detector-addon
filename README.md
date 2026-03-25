@@ -1,9 +1,15 @@
 # DHCP Detector — Home Assistant App
 
 Passive DHCP sniffing for presence detection.  
-The app monitors DHCP traffic on the host network interface and writes a
-timestamp sensor per tracked device to Home Assistant via the Supervisor REST API —
-no MQTT, no extra integrations, no manual YAML required.
+The add-on monitors DHCP traffic on the host network interface and publishes a
+timestamp sensor per tracked device to Home Assistant via **MQTT Discovery** —
+entities are registered persistently in the HA Entity Registry and survive HA
+restarts without any manual YAML configuration.
+
+> **Requires the [Mosquitto broker](https://github.com/home-assistant/addons/tree/master/mosquitto)
+> add-on** (or another MQTT broker) to be installed and running before this
+> add-on is started.  The Supervisor will verify this automatically via the
+> `services: mqtt:need` declaration and surface a clear error if it is missing.
 
 ---
 
@@ -12,37 +18,46 @@ no MQTT, no extra integrations, no manual YAML required.
 1. A raw `AF_PACKET` socket listens for DHCP **DISCOVER**, **REQUEST**, and **INFORM**
    packets sent by devices on the local network.
 2. The source MAC address in each packet is matched against your configured device list.
-3. On a match the app calls the Supervisor REST API to create or update a
-   `sensor.dhcp_last_seen_<name>` entity:
+3. On startup, the add-on publishes a retained **MQTT Discovery** config message for
+   each tracked device, which registers a persistent `sensor.dhcp_last_seen_<name>`
+   entity in HA:
    ```
-   POST http://supervisor/homeassistant/api/states/sensor.dhcp_last_seen_<name>
-   {
-     "state": "2026-03-20T14:39:47+01:00",
-     "attributes": {
-       "device_class": "timestamp",
-       "friendly_name": "DHCP Last Seen <name>",
-       "mac": "aa:bb:cc:dd:ee:ff"
-     }
-   }
+   Topic:   homeassistant/sensor/dhcp_last_seen_<dev_id>/config
+   Retain:  true
+   Payload: { "name": "DHCP Last Seen <name>", "device_class": "timestamp", … }
    ```
-   HA creates the sensor entity automatically on the first call; subsequent calls
-   update the timestamp.
+4. On a MAC match the add-on publishes a retained ISO 8601 timestamp to the
+   device's state topic:
+   ```
+   Topic:   dhcp_presence/<dev_id>/state
+   Retain:  true
+   Payload: 2026-03-20T14:39:47+01:00
+   ```
+5. Availability is tracked via a shared topic:
+   ```
+   Topic:   dhcp_presence/availability
+   Retain:  true
+   Payload: "online" (on startup) / "offline" (on shutdown or connection loss)
+   ```
+   HA marks all sensors unavailable automatically when "offline" is received.
 
-The app never transmits any DHCP packets and never interferes with your existing
+The add-on never transmits any DHCP packets and never interferes with your existing
 DHCP server.
 
 ---
 
 ## Installation
 
-1. In Home Assistant, go to **Settings → Add-ons → App store**.
-2. Click the **⋮** menu (top-right) and choose **Repositories**.
-3. Add the URL of this repository, then click **Add**.
-4. Find **DHCP Detector** in the store and click **Install**.
-5. Configure the app (see [Options](#options) below), then click **Start**.
+1. Install the **Mosquitto broker** add-on from the official HA add-on store and
+   start it before proceeding.
+2. In Home Assistant, go to **Settings → Add-ons → App store**.
+3. Click the **⋮** menu (top-right) and choose **Repositories**.
+4. Add the URL of this repository, then click **Add**.
+5. Find **DHCP Detector** in the store and click **Install**.
+6. Configure the add-on (see [Options](#options) below), then click **Start**.
 
 Alternatively, copy the `dhcp_detector/` directory into your
-`/addons/` folder on the Home Assistant OS file system (local app install).
+`/addons/` folder on the Home Assistant OS file system (local add-on install).
 
 ---
 
@@ -54,6 +69,10 @@ Alternatively, copy the `dhcp_detector/` directory into your
 | `devices` | `list` | `[]` | List of `{ mac, name }` pairs to track (see below). |
 | `log_level` | `string` | `info` | Logging verbosity: `debug`, `info`, `warning`, or `error`. Use `debug` to enable detailed diagnostics. |
 | `disable_bpf` | `bool` | `false` | When `true`, the BPF kernel filter is not attached. Useful when troubleshooting missing packets. |
+| `mqtt_host` | `string` | `core-mosquitto` | Hostname or IP address of the MQTT broker. Use the default for the Mosquitto add-on. |
+| `mqtt_port` | `integer` | `1883` | TCP port of the MQTT broker. |
+| `mqtt_username` | `string` | `""` | MQTT username (leave empty if authentication is not required). |
+| `mqtt_password` | `string` | `""` | MQTT password (leave empty if authentication is not required). |
 
 ### Devices list example
 
@@ -90,7 +109,7 @@ device class, so it appears as a formatted date/time in the UI.
 
 ## Deriving home / not_home state
 
-Because the app only writes a "last seen" timestamp, you derive the presence state
+Because the add-on only writes a "last seen" timestamp, you derive the presence state
 in Home Assistant using a **Template Binary Sensor**.  Add the following to your
 `configuration.yaml` (or a package file):
 
@@ -115,13 +134,13 @@ Adjust `timedelta(minutes=10)` to suit your network's DHCP renewal interval.
 
 ## Notes
 
-* The app requires **host networking** (`host_network: true`) and the `NET_RAW`
+* The add-on requires **host networking** (`host_network: true`) and the `NET_RAW`
   Linux capability so it can open a raw socket.  Both are configured automatically.
-* The `SUPERVISOR_TOKEN` environment variable is injected automatically by the
-  Supervisor — no credentials need to be entered.
+* The Mosquitto broker add-on (or equivalent) must be running; the Supervisor checks
+  this automatically via `services: mqtt:need`.
 * Presence latency is typically 1–3 seconds from when a device (re-)joins the network.
-* The app only ever writes sensor state — it never reads state from HA and has no
-  internal timeout watchdog.
+* The add-on only ever publishes sensor state — it never reads state from HA and has
+  no internal timeout watchdog.
 
 ---
 
@@ -172,7 +191,7 @@ Counter meanings:
 | `msgtype` | DHCP message type not DISCOVER/REQUEST/INFORM |
 | `mac` | Valid DHCP packet but MAC not in tracked device list |
 | `matched` | Packets matched and sensor update attempted |
-| `ok` | Successful sensor updates sent to HA |
+| `ok` | Successful sensor updates sent via MQTT |
 | `fail` | Failed sensor update attempts |
 
 * If `recv=0` after a forced DHCP renewal, **no frames are reaching the add-on at all**.

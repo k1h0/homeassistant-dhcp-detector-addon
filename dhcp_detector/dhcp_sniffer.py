@@ -3,24 +3,24 @@
 Passive DHCP sniffer for Home Assistant presence detection.
 
 Listens for DHCP DISCOVER, REQUEST, and INFORM packets on a raw socket,
-matches source MACs against a configured device list, and writes a
-timestamp sensor state to Home Assistant via the Supervisor REST API.
+matches source MACs against a configured device list, and publishes
+timestamp sensor state to Home Assistant via MQTT Discovery.
 """
 
 import ctypes
 import re
 import json
 import logging
-import os
 import signal
 import socket
 import struct
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 from datetime import datetime
+
+# paho-mqtt client for MQTT Discovery and state publishing
+import paho.mqtt.client as mqtt_client
 
 # ---------------------------------------------------------------------------
 # Diagnostics counters
@@ -383,103 +383,77 @@ def parse_dhcp_packet(data: bytes):
 
 
 # ---------------------------------------------------------------------------
-# Home Assistant Supervisor API
+# MQTT helpers
 # ---------------------------------------------------------------------------
 
-HA_STATE_URL = "http://supervisor/homeassistant/api/states/sensor.dhcp_last_seen_{dev_id}"
+# Shared availability topic for all sensors managed by this add-on.
+AVAILABILITY_TOPIC = "dhcp_presence/availability"
 
 
-def set_all_sensors_unavailable(token: str, device_map: dict) -> None:
-    """POST state 'unavailable' for every tracked sensor via the Supervisor API.
+def mqtt_connect(host: str, port: int, username: str, password: str) -> mqtt_client.Client:
+    """Create and connect a paho MQTT client.
 
-    Preserves device_class and friendly_name so HA does not lose sensor metadata.
-    Called on startup (before the socket is opened) and on clean shutdown.
+    Returns the connected client instance.
     """
-    for mac, name in device_map.items():
+    client = mqtt_client.Client()
+    # Set last-will so the broker publishes "offline" if the connection drops unexpectedly.
+    client.will_set(AVAILABILITY_TOPIC, payload="offline", retain=True)
+    if username:
+        client.username_pw_set(username, password or None)
+    client.connect(host, port, keepalive=60)
+    client.loop_start()
+    logging.info("Connected to MQTT broker at %s:%d", host, port)
+    return client
+
+
+def publish_discovery(client: mqtt_client.Client, device_map: dict) -> None:
+    """Publish retained MQTT Discovery config messages for each tracked device.
+
+    Registers a persistent timestamp sensor in HA for every entry in device_map.
+    Called once on startup before the availability "online" message is sent.
+    """
+    for _mac, name in device_map.items():
         dev_id = sanitize_dev_id(name)
+        topic = f"homeassistant/sensor/dhcp_last_seen_{dev_id}/config"
         payload = json.dumps({
-            "state": "unavailable",
-            "attributes": {
-                "device_class": "timestamp",
-                "friendly_name": f"DHCP Last Seen {name}",
-                "mac": mac,
-            },
-        }).encode()
-        url = HA_STATE_URL.format(dev_id=dev_id)
-        req = urllib.request.Request(
-            url,
-            data=payload,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                if resp.status in (200, 201):
-                    logging.info("sensor.dhcp_last_seen_%s → unavailable", dev_id)
-                else:
-                    logging.warning(
-                        "Unexpected status setting sensor.dhcp_last_seen_%s unavailable: %s",
-                        dev_id, resp.status,
-                    )
-        except urllib.error.HTTPError as exc:
-            logging.error(
-                "HTTP error setting sensor.dhcp_last_seen_%s unavailable: %s %s",
-                dev_id, exc.code, exc.reason,
-            )
-        except urllib.error.URLError as exc:
-            logging.error(
-                "URL error setting sensor.dhcp_last_seen_%s unavailable: %s",
-                dev_id, exc.reason,
-            )
-        except OSError as exc:
-            logging.error(
-                "Error setting sensor.dhcp_last_seen_%s unavailable: %s",
-                dev_id, exc,
-            )
+            "name": f"DHCP Last Seen {name}",
+            "state_topic": f"dhcp_presence/{dev_id}/state",
+            "device_class": "timestamp",
+            "unique_id": f"dhcp_last_seen_{dev_id}",
+            "availability_topic": AVAILABILITY_TOPIC,
+            "payload_available": "online",
+            "payload_not_available": "offline",
+        })
+        client.publish(topic, payload=payload, retain=True)
+        logging.info("Published discovery config for sensor.dhcp_last_seen_%s", dev_id)
 
 
-def update_sensor(token: str, mac: str, name: str) -> bool:
-    """POST a timestamp sensor state to HA via the Supervisor proxy.
+def publish_availability(client: mqtt_client.Client, available: bool) -> None:
+    """Publish the add-on availability (online/offline) with retain=True.
 
-    Creates or updates ``sensor.dhcp_last_seen_<dev_id>`` with the current
-    local time as the state value (ISO 8601 with timezone offset).
+    Called after discovery on startup ("online") and on shutdown ("offline").
+    """
+    payload = "online" if available else "offline"
+    client.publish(AVAILABILITY_TOPIC, payload=payload, retain=True)
+    logging.info("Published availability: %s", payload)
 
+
+def publish_state(client: mqtt_client.Client, mac: str, name: str) -> bool:
+    """Publish a retained ISO 8601 timestamp to the device's state topic.
+
+    Replaces the former update_sensor() REST API call.
     Returns True on success, False on error.
     """
-    # Sanitize name → valid HA entity ID segment (lowercase, only a-z/0-9/_).
     dev_id = sanitize_dev_id(name)  # deduplicated via module-level helper
     timestamp = datetime.now().astimezone().isoformat()
-    payload = json.dumps({
-        "state": timestamp,
-        "attributes": {
-            "device_class": "timestamp",
-            "friendly_name": f"DHCP Last Seen {name}",  # human-readable, unchanged
-            "mac": mac,
-        },
-    }).encode()
-    url = HA_STATE_URL.format(dev_id=dev_id)  # use sanitized dev_id in the URL
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
+    topic = f"dhcp_presence/{dev_id}/state"
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status in (200, 201)
-    except urllib.error.HTTPError as exc:
-        logging.error("HTTP error updating sensor for %s (%s): %s %s", name, mac, exc.code, exc.reason)
-    except urllib.error.URLError as exc:
-        logging.error("URL error updating sensor for %s (%s): %s", name, mac, exc.reason)
-    except OSError as exc:
-        logging.error("Error updating sensor for %s (%s): %s", name, mac, exc)
-    return False
+        result = client.publish(topic, payload=timestamp, retain=True)
+        result.wait_for_publish(timeout=5)
+        return True
+    except (ValueError, RuntimeError) as exc:
+        logging.error("MQTT publish error for %s (%s): %s", name, mac, exc)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -508,18 +482,17 @@ def main():
     devices = options.get("devices", [])
     log_level_str = options.get("log_level", "info").upper()
     disable_bpf = options.get("disable_bpf", False)
+    # MQTT broker connection settings from add-on options
+    mqtt_host = options.get("mqtt_host", "core-mosquitto")
+    mqtt_port = options.get("mqtt_port", 1883)
+    mqtt_username = options.get("mqtt_username", "")
+    mqtt_password = options.get("mqtt_password", "")
 
     # Reconfigure logging with the user-chosen level.
     numeric_level = getattr(logging, log_level_str, logging.INFO)
     logging.getLogger().setLevel(numeric_level)
     for handler in logging.getLogger().handlers:
         handler.setLevel(numeric_level)
-
-    token = os.environ.get("SUPERVISOR_TOKEN", "")
-    if not token:
-        logging.error("SUPERVISOR_TOKEN environment variable is not set. "
-                      "Ensure homeassistant_api is enabled in config.yaml.")
-        sys.exit(1)
 
     # Build MAC → friendly-name mapping; normalise MACs to lowercase colon-separated.
     device_map: dict[str, str] = {}
@@ -537,19 +510,24 @@ def main():
         logging.info("BPF filter disabled — running unfiltered capture (disable_bpf=true)")
     logging.debug("log_level=%s disable_bpf=%s", log_level_str, disable_bpf)
 
-    # Mark all tracked sensors unavailable before the socket is opened so that
-    # HA reflects the correct state after a restart while the add-on is not yet running.
-    logging.info("Setting all sensors unavailable on startup …")
-    set_all_sensors_unavailable(token, device_map)
+    # Connect to MQTT broker and publish discovery configs + "online" availability.
+    try:
+        mqttc = mqtt_connect(mqtt_host, mqtt_port, mqtt_username, mqtt_password)
+    except Exception as exc:
+        logging.error("Failed to connect to MQTT broker at %s:%d: %s", mqtt_host, mqtt_port, exc)
+        sys.exit(1)
+
+    # Publish retained discovery config for each tracked device once on startup.
+    publish_discovery(mqttc, device_map)
+    # Signal that the add-on is online; HA marks all sensors available via availability_topic.
+    publish_availability(mqttc, available=True)
 
     stop_event = threading.Event()
 
     def handle_shutdown_signal(signum, frame):
         logging.info("Received signal %s — shutting down.", signum)
-        # Mark all tracked sensors unavailable before stopping so HA reflects
-        # the correct state when the add-on is stopped cleanly via the Supervisor.
-        logging.info("Setting all sensors unavailable on shutdown …")
-        set_all_sensors_unavailable(token, device_map)
+        # Publish "offline" so HA marks all sensors unavailable via availability_topic.
+        publish_availability(mqttc, available=False)
         stop_event.set()
 
     signal.signal(signal.SIGTERM, handle_shutdown_signal)
@@ -612,7 +590,7 @@ def main():
 
         _counters.inc("matched")
         name = device_map[mac]
-        # Derive the sanitized entity ID the same way update_sensor does.
+        # Derive the sanitized entity ID the same way publish_state does.
         dev_id = sanitize_dev_id(name)  # deduplicated via module-level helper
         type_name = MSG_TYPE_NAMES.get(dhcp_type, str(dhcp_type))
         logging.info(
@@ -624,13 +602,15 @@ def main():
             dev_id,  # log the actual entity ID that will be written
         )
 
-        ok = update_sensor(token, mac, name)
+        ok = publish_state(mqttc, mac, name)
         if ok:
             _counters.inc("sensor_update_success")
         else:
             _counters.inc("sensor_update_fail")
 
     sock.close()
+    mqttc.loop_stop()
+    mqttc.disconnect()
     logging.info("DHCP Detector stopped.")
 
 
