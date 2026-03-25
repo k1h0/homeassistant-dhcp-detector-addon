@@ -173,6 +173,16 @@ _FILTER_EXPR = b"udp and (port 67 or port 68)"
 # Maximum time (seconds) to wait for the initial MQTT CONNACK on startup.
 MQTT_CONNECT_TIMEOUT = 30
 
+# Add-on version reported in the MQTT device registry.
+# NOTE: config.yaml is not copied into the Docker image, so the version cannot
+# be read at runtime. Keep this constant in sync with config.yaml manually.
+ADDON_VERSION = "1.1.1"
+
+# Interval (seconds) between periodic availability heartbeat publishes.
+# Ensures the sensor stays "online" in HA even during long quiet periods
+# when no DHCP activity triggers any MQTT publishes.
+AVAILABILITY_HEARTBEAT_INTERVAL = 300
+
 
 class _BpfInsn(ctypes.Structure):
     _fields_ = [
@@ -387,11 +397,43 @@ def parse_dhcp_packet(data: bytes):
 
 
 # ---------------------------------------------------------------------------
+# Availability heartbeat
+# ---------------------------------------------------------------------------
+
+
+def _availability_heartbeat_thread(
+    stop_event: threading.Event,
+    client: mqtt_client.Client,
+    interval: int = AVAILABILITY_HEARTBEAT_INTERVAL,
+) -> None:
+    """Periodically re-publish the availability 'online' message.
+
+    Ensures the sensor stays available in HA even during long quiet periods
+    when no DHCP activity triggers any other MQTT publishes.  The retained
+    message on the broker is refreshed every *interval* seconds so that a
+    broker restart or brief HA disconnect recovers without manual intervention.
+    """
+    while not stop_event.wait(interval):
+        logging.debug("Heartbeat: re-publishing availability 'online'")
+        publish_availability(client, available=True)
+
+
+# ---------------------------------------------------------------------------
 # MQTT helpers
 # ---------------------------------------------------------------------------
 
 # Shared availability topic for all sensors managed by this add-on.
 AVAILABILITY_TOPIC = "dhcp_presence/availability"
+
+# Device object shared by all discovery payloads — groups every tracked-device
+# sensor under a single "DHCP Detector" entry in the HA device registry.
+DISCOVERY_DEVICE = {
+    "identifiers": ["dhcp_detector"],
+    "name": "DHCP Detector",
+    "model": "DHCP Detector",
+    "manufacturer": "Home Assistant Add-on",
+    "sw_version": ADDON_VERSION,
+}
 
 
 def mqtt_connect(
@@ -465,6 +507,7 @@ def publish_discovery(client: mqtt_client.Client, device_map: dict) -> None:
             "availability_topic": AVAILABILITY_TOPIC,
             "payload_available": "online",
             "payload_not_available": "offline",
+            "device": DISCOVERY_DEVICE,
         })
         client.publish(topic, payload=payload, retain=True)
         logging.info("Published discovery config for sensor.dhcp_last_seen_%s", dev_id)
@@ -624,6 +667,16 @@ def main():
         name="diag-summary",
     )
     diag_thread.start()
+
+    # Start background thread that periodically re-publishes availability "online".
+    # This keeps the sensor visible in HA even when no DHCP events occur for hours.
+    heartbeat_thread = threading.Thread(
+        target=_availability_heartbeat_thread,
+        args=(stop_event, mqttc),
+        daemon=True,
+        name="avail-heartbeat",
+    )
+    heartbeat_thread.start()
 
     while not stop_event.is_set():
         try:
