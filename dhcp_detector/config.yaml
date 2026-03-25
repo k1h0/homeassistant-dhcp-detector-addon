@@ -1,6 +1,6 @@
 name: DHCP Detector
 description: Passive DHCP sniffing for presence detection via timestamp sensors
-version: "1.0.2"
+version: "1.0.3"
 slug: dhcp_detector
 init: false
 
@@ -16,8 +16,9 @@ host_network: true
 capabilities:
   - NET_RAW
 
-# Grants the app access to the HA Core REST API via the Supervisor proxy.
-homeassistant_api: true
+# Declares that this add-on requires an MQTT broker (e.g. Mosquitto) before starting.
+services:
+  - mqtt:need
 
 startup: application
 boot: auto
@@ -27,6 +28,11 @@ options:
   devices: []
   log_level: "info"
   disable_bpf: false
+  # MQTT broker connection settings
+  mqtt_host: "core-mosquitto"
+  mqtt_port: 1883
+  mqtt_username: ""
+  mqtt_password: ""
 
 schema:
   interface: str
@@ -35,6 +41,11 @@ schema:
       name: str
   log_level: "list(debug|info|warning|error)"
   disable_bpf: bool
+  # MQTT broker connection settings
+  mqtt_host: str
+  mqtt_port: int
+  mqtt_username: str
+  mqtt_password: str
 
 # Selector configuration for the HA UI
 ui_schema:
