@@ -1,6 +1,6 @@
 name: DHCP Detector
 description: Passive DHCP sniffing for presence detection via timestamp sensors
-version: "1.0.4"
+version: "1.0.5"
 slug: dhcp_detector
 init: false
 
@@ -13,6 +13,9 @@ arch:
 
 # Requires raw socket access to the host network interface.
 host_network: true
+
+# Enable Supervisor API access so MQTT credentials can be fetched automatically.
+hassio_api: true
 capabilities:
   - NET_RAW
 

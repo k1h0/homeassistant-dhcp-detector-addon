@@ -71,10 +71,10 @@ Alternatively, copy the `dhcp_detector/` directory into your
 | `disable_bpf` | `bool` | `false` | When `true`, the BPF kernel filter is not attached. Useful when troubleshooting missing packets. |
 
 > **MQTT connection settings are configured automatically.**  
-> When the Mosquitto broker add-on is running, the HA Supervisor injects the
-> correct host, port, username, and password as environment variables
-> (`MQTT_HOST`, `MQTT_PORT`, `MQTT_USERNAME`, `MQTT_PASSWORD`) — no manual
-> MQTT configuration is required.
+> When the Mosquitto broker add-on is running, the HA Supervisor provides the
+> correct host, port, username, and password via its Services API
+> (`GET http://supervisor/services/mqtt`) — no manual MQTT configuration is
+> required.
 
 ### Devices list example
 

@@ -18,6 +18,8 @@ import struct
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime
 
 # paho-mqtt client for MQTT Discovery and state publishing
@@ -436,6 +438,55 @@ DISCOVERY_DEVICE = {
 }
 
 
+def get_mqtt_credentials(supervisor_token: str) -> dict:
+    """Fetch MQTT credentials from the Supervisor Services API.
+
+    Calls GET http://supervisor/services/mqtt with a Bearer token and
+    returns a dict with keys: host, port, username, password.
+
+    Raises RuntimeError if the request fails or the service is unavailable.
+    """
+    url = "http://supervisor/services/mqtt"
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {supervisor_token}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(
+            f"Supervisor Services API returned HTTP {exc.code} for {url}"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "Supervisor Services API returned invalid JSON"
+        ) from exc
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to reach Supervisor Services API at {url}: {exc}"
+        ) from exc
+
+    data = body.get("data", {})
+    for key in ("host", "port", "username", "password"):
+        if key not in data:
+            raise RuntimeError(
+                f"Supervisor Services API response missing field '{key}': {body}"
+            )
+    try:
+        port = int(data["port"])
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError(
+            f"Invalid port value in Supervisor response: {data['port']!r}"
+        ) from exc
+    return {
+        "host": data["host"],
+        "port": port,
+        "username": data["username"],
+        "password": data["password"],
+    }
+
+
 def mqtt_connect(
     host: str,
     port: int,
@@ -567,24 +618,23 @@ def main():
     devices = options.get("devices", [])
     log_level_str = options.get("log_level", "info").upper()
     disable_bpf = options.get("disable_bpf", False)
-    # MQTT broker settings — read from HA Supervisor service-discovery environment
-    # variables injected automatically when `services: mqtt:need` is declared.
-    # Fall back to options.json values for backward compatibility.
-    mqtt_host = (
-        os.environ.get("MQTT_HOST")
-        or options.get("mqtt_host", "core-mosquitto")
-    )
-    mqtt_port = int(
-        os.environ.get("MQTT_PORT") or options.get("mqtt_port", 1883) or 1883
-    )
-    mqtt_username = (
-        os.environ.get("MQTT_USERNAME")
-        or options.get("mqtt_username", "")
-    )
-    mqtt_password = (
-        os.environ.get("MQTT_PASSWORD")
-        or options.get("mqtt_password", "")
-    )
+
+    # MQTT broker credentials — obtained automatically from the Supervisor
+    # Services API using the SUPERVISOR_TOKEN injected at runtime.
+    supervisor_token = os.environ.get("SUPERVISOR_TOKEN", "")
+    if not supervisor_token:
+        logging.error("SUPERVISOR_TOKEN is not set; cannot fetch MQTT credentials")
+        sys.exit(1)
+    try:
+        mqtt_creds = get_mqtt_credentials(supervisor_token)
+    except RuntimeError as exc:
+        logging.error("Could not obtain MQTT credentials: %s", exc)
+        sys.exit(1)
+    logging.info("MQTT credentials obtained from Supervisor")
+    mqtt_host = mqtt_creds["host"]
+    mqtt_port = mqtt_creds["port"]
+    mqtt_username = mqtt_creds["username"]
+    mqtt_password = mqtt_creds["password"]
 
     # Reconfigure logging with the user-chosen level.
     numeric_level = getattr(logging, log_level_str, logging.INFO)
